@@ -1,0 +1,18 @@
+RAILWAY DEPLOYMENT GUIDE
+=========================
+
+1. Upload this project to GitHub (or deploy the repository directly if supported).
+2. Create a Railway project and deploy the repository.
+3. Add your secrets under Variables. At minimum:
+   BOT_TOKEN=your Telegram bot token
+4. Do NOT put the real bot token in this ZIP or GitHub.
+5. Railway should use:
+   Start Command: python bot.py
+   or the included Procfile: worker: python bot.py
+6. Deploy and open the deployment logs. A successful bot should remain running
+   without a crash/restart loop.
+
+Important:
+- Free hosting availability, limits, sleep policies, and pricing can change.
+- Downloading from third-party services can require external APIs/cookies and
+  may be subject to their terms and copyright rules.
