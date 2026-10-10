@@ -567,7 +567,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]))
         return
     messages = {
-        "download": "🎵 Send a supported music URL in this chat. Then choose a format/quality button. Playlists are disabled.",
+        "download": "🎬 Send a supported video/music URL. You will get 4 video qualities + Song/MP3.",
         "edit": "🎚️ First send a music link or upload an audio file, then send /edit to open effect presets.",
         "vocalremove": "🎤 First send/upload audio, then send /vocalremove to create a vocal-reduced/instrumental version.",
         "funk": "⚡ First send/upload audio, then send /funk to create an Auto Funk edit.",
@@ -603,7 +603,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]))
         return
     messages = {
-        "download": "🎵 Send a supported music URL in this chat. Then choose a format/quality button. Playlists are disabled.",
+        "download": "🎬 Send a supported video/music URL. You will get 4 video qualities + Song/MP3.",
         "edit": "🎚️ First send a music link or upload an audio file, then send /edit to open effect presets.",
         "vocalremove": "🎤 First send/upload audio, then send /vocalremove to create a vocal-reduced/instrumental version.",
         "funk": "⚡ First send/upload audio, then send /funk to create an Auto Funk edit.",
@@ -628,6 +628,52 @@ async def lang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(t(uid, "lang_switched"))
     else:
         await update.message.reply_text("Usage: /lang en   or   /lang hi")
+
+
+def list_download_buttons():
+    return [
+        [InlineKeyboardButton("🎬 360p Video", callback_data="dl|360")],
+        [InlineKeyboardButton("🎬 480p Video", callback_data="dl|480")],
+        [InlineKeyboardButton("🎬 720p Video", callback_data="dl|720")],
+        [InlineKeyboardButton("🎬 1080p Video", callback_data="dl|1080")],
+        [InlineKeyboardButton("🎵 Song / MP3", callback_data="dl|audio")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_download")],
+    ]
+
+async def download_video(url: str, height: int, cancel_event=None, out_dir: str = TEMP_DIR) -> str:
+    url = validate_url(url)
+    os.makedirs(out_dir, exist_ok=True)
+    out_tmpl = os.path.join(out_dir, "%(title).150B [%(id)s].%(ext)s")
+    def hook(d):
+        if cancel_event and cancel_event.is_set():
+            raise DownloadCancelled("User cancelled")
+    opts = {
+        **YDL_OPTS_BASE,
+        "format": f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best",
+        "outtmpl": out_tmpl,
+        "merge_output_format": "mp4",
+        "progress_hooks": [hook],
+        "prefer_ffmpeg": True,
+    }
+    loop = asyncio.get_event_loop()
+    def run():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            media_id = str(info.get("id", ""))
+            candidates = []
+            for f in os.listdir(out_dir):
+                fp = os.path.join(out_dir, f)
+                if media_id and media_id in f and os.path.isfile(fp) and not f.endswith((".part", ".ytdl")):
+                    candidates.append(fp)
+            if candidates:
+                return max(candidates, key=os.path.getmtime)
+            raise FileNotFoundError("Downloaded video file not found")
+    path = await loop.run_in_executor(None, run)
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+    if size_mb > MAX_FILE_SIZE_MB:
+        os.remove(path)
+        raise ValueError(f"File too large: {size_mb:.1f} MB")
+    return path
 
 
 async def handle_link_or_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -674,22 +720,9 @@ async def handle_link_or_file(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         info = await get_info(text)
         title = info.get("title", "Unknown")[:60]
-        formats = list_audio_formats(info)
-        keyboard = []
-        row = []
-        for i, (fid, label, _) in enumerate(formats):
-            # callback: dl|format_id|url_hash or store url in context
-            # Store url in user_data temporarily
-            get_user(uid)["pending_url"] = text
-            get_user(uid)["pending_info"] = info
-            cb = f"fmt|{fid}"
-            row.append(InlineKeyboardButton(label[:40], callback_data=cb))
-            if len(row) == 2:
-                keyboard.append(row)
-                row = []
-        if row:
-            keyboard.append(row)
-        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_download")])
+        get_user(uid)["pending_url"] = text
+        get_user(uid)["pending_info"] = info
+        keyboard = list_download_buttons()
         await status.edit_text(
             f"🎵 *{title}*\n\n{t(uid, 'choose_format')}",
             parse_mode=ParseMode.MARKDOWN,
@@ -704,68 +737,36 @@ async def format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     uid = query.from_user.id
     data = query.data
-
     if data == "cancel_download":
-        u = get_user(uid)
-        if u.get("cancel"):
-            u["cancel"].set()
+        if get_user(uid).get("cancel"):
+            get_user(uid)["cancel"].set()
         await query.edit_message_text(t(uid, "cancelled"))
         return
-
-    if not data.startswith("fmt|"):
+    if not data.startswith("dl|"):
         return
-
-    format_id = data.split("|", 1)[1]
+    choice = data.split("|", 1)[1]
     url = get_user(uid).get("pending_url")
     if not url:
-        await query.edit_message_text(t(uid, "error", msg="No pending URL"))
+        await query.edit_message_text(t(uid, "error", msg="No pending URL. Send the link again."))
         return
-
     cancel_event = asyncio.Event()
     get_user(uid)["cancel"] = cancel_event
-
-    progress_msg = await query.edit_message_text(t(uid, "downloading", progress="0%"))
-
-    last_update = 0
-
-    def progress_cb(d):
-        nonlocal last_update
-        now = time.time()
-        if now - last_update < 2:
-            return
-        last_update = now
-        # We cannot easily edit from thread; just log for now.
-        # Real progress update would need a queue + background task.
-        p = d.get("_percent_str", "?")
-        logger.info(f"Progress: {p}")
-
+    progress_msg = await query.edit_message_text("⬇️ Downloading...")
     try:
-        path = await download_audio(
-            url,
-            format_id=format_id,
-            progress_callback=progress_cb,
-            cancel_event=cancel_event,
-        )
-        get_user(uid)["last_audio"] = path
-        size_mb = os.path.getsize(path) / (1024 * 1024)
-        caption = f"{t(uid, 'done')}\nSize: {size_mb:.1f} MB"
-        with open(path, "rb") as f:
-            await context.bot.send_audio(
-                chat_id=query.message.chat_id,
-                audio=f,
-                caption=caption,
-                title=os.path.basename(path)[:60],
-            )
-        await progress_msg.edit_text(t(uid, "done") + " Use /edit /funk /vocalremove")
+        if choice == "audio":
+            path = await download_audio(url, format_id="bestaudio/best", cancel_event=cancel_event)
+            with open(path, "rb") as f:
+                await context.bot.send_audio(chat_id=query.message.chat_id, audio=f, caption="🎵 Song / MP3 ready!", title=os.path.basename(path)[:60])
+        elif choice in {"360", "480", "720", "1080"}:
+            path = await download_video(url, int(choice), cancel_event=cancel_event)
+            with open(path, "rb") as f:
+                await context.bot.send_video(chat_id=query.message.chat_id, video=f, caption=f"🎬 {choice}p Video ready!", supports_streaming=True)
+        else:
+            await progress_msg.edit_text(t(uid, "error", msg="Unknown download option"))
+            return
+        await progress_msg.edit_text(t(uid, "done"))
     except DownloadCancelled:
         await progress_msg.edit_text(t(uid, "cancelled"))
-    except ValueError as e:
-        if "too large" in str(e).lower():
-            await progress_msg.edit_text(
-                t(uid, "too_large", size=str(e).split(":")[-1].strip(), limit=MAX_FILE_SIZE_MB)
-            )
-        else:
-            await progress_msg.edit_text(t(uid, "error", msg=str(e)[:200]))
     except Exception as e:
         logger.exception("Download failed")
         await progress_msg.edit_text(t(uid, "error", msg=str(e)[:300]))
@@ -944,7 +945,7 @@ def main():
     app.add_handler(CommandHandler("edit", edit_cmd))
     app.add_handler(CommandHandler("analyze", analyze_cmd))
 
-    app.add_handler(CallbackQueryHandler(format_callback, pattern=r"^(fmt\||cancel_download)$"))
+    app.add_handler(CallbackQueryHandler(format_callback, pattern=r"^(dl\||cancel_download)$"))
     app.add_handler(CallbackQueryHandler(effect_callback, pattern=r"^(fx\||cancel_effect)$"))
 
     app.add_handler(
