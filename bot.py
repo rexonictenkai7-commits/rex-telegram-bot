@@ -1,10 +1,479 @@
 #!/usr/bin/env python3
 """
 Telegram Music Edit & Download Bot
-Features: link download with format buttons, progress, cancel,
-vocal remove (basic + optional Demucs), funk edit, effects, analyze,
-Hindi/English UI, FFmpeg based processing.
+SINGLE-FILE RAILWAY BUILD
+All local helper modules are embedded below so GitHub mobile folder-upload
+issues cannot cause ModuleNotFoundError for locales/utils.
 """
+
+# ===== Embedded config.py =====
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+MAX_FILE_SIZE_MB = max(1, min(49, int(os.getenv("MAX_FILE_SIZE_MB", "49"))))
+DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+
+# Temp directory for downloads/processing
+TEMP_DIR = os.path.join(os.path.dirname(__file__), "temp")
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# yt-dlp options base
+YDL_OPTS_BASE = {
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,  # safer: one track per request
+    "extract_flat": False,
+}
+
+
+# ===== Embedded locales/__init__.py =====
+TEXTS = {
+    "en": {
+        "start": (
+            "🎵 *Welcome to Music Edit Bot!*\n\n"
+            "Send me a YouTube / music link or upload an audio file.\n"
+            "I can download, remove vocals, apply effects, analyze songs & more.\n\n"
+            "Commands:\n"
+            "/start - This message\n"
+            "/help - Full help\n"
+            "/edit - Edit last audio with effects\n"
+            "/funk - Auto Funk Edit\n"
+            "/vocalremove - Remove vocals / get instrumental\n"
+            "/analyze - Song analysis (BPM, etc.)\n"
+            "/lang - Switch language (en/hi)\n\n"
+            "Just paste a link to start downloading!"
+        ),
+        "help": (
+            "📖 *Help*\n\n"
+            "*Download:*\n"
+            "• Send any supported link (YouTube, SoundCloud, etc.)\n"
+            "• Choose format / quality with buttons\n"
+            "• Progress shown + Cancel button\n"
+            "• Auto size check (Telegram limit)\n\n"
+            "*Editing:*\n"
+            "• /vocalremove - Extract vocals or instrumental (FFmpeg basic + optional Demucs)\n"
+            "• /funk - Quick funky edit (speed + pitch + effects)\n"
+            "• /edit - Open effects menu (bass, pitch, speed, volume, reverse, etc.)\n"
+            "• /analyze - Basic song info + BPM estimate\n\n"
+            "*150+ effects:* Many presets available via /edit buttons.\n"
+            "Upload audio or reply to a file with commands.\n\n"
+            "Language: /lang en  or  /lang hi"
+        ),
+        "choose_format": "🎚 Choose quality / format:",
+        "downloading": "⬇️ Downloading... {progress}",
+        "processing": "⚙️ Processing with FFmpeg...",
+        "done": "✅ Done! Here's your file:",
+        "error": "❌ Error: {msg}",
+        "cancelled": "🚫 Cancelled by user.",
+        "too_large": "⚠️ File too large for Telegram Bot API ({size} MB > {limit} MB). Try lower quality.",
+        "no_audio": "No audio found. Send a link or upload an audio file first.",
+        "lang_switched": "Language set to English 🇬🇧",
+        "vocal_start": "🎤 Removing vocals / extracting stems... (this may take time)",
+        "funk_start": "⚡ Creating Auto Funk Edit...",
+        "analyze_start": "📊 Analyzing song...",
+        "choose_effect": "🎚️ Choose effect / preset:",
+        "upload_or_link": "Send a song link or upload an audio file.",
+    },
+    "hi": {
+        "start": (
+            "🎵 *Music Edit Bot mein aapka swagat hai!*\n\n"
+            "Mujhe YouTube / music link bhejo ya audio file upload karo.\n"
+            "Main download, vocal remove, effects, analysis kar sakta hoon.\n\n"
+            "Commands:\n"
+            "/start - Ye message\n"
+            "/help - Poori help\n"
+            "/edit - Last audio edit karo\n"
+            "/funk - Auto Funk Edit\n"
+            "/vocalremove - Vocals hatao / instrumental banao\n"
+            "/analyze - Song analysis (BPM etc.)\n"
+            "/lang - Language badlo (en/hi)\n\n"
+            "Bas link paste karo download shuru karne ke liye!"
+        ),
+        "help": (
+            "📖 *Help*\n\n"
+            "*Download:*\n"
+            "• Koi bhi supported link bhejo (YouTube, SoundCloud etc.)\n"
+            "• Buttons se format / quality choose karo\n"
+            "• Progress dikhega + Cancel button\n"
+            "• Automatic size check\n\n"
+            "*Editing:*\n"
+            "• /vocalremove - Vocals nikaalo ya instrumental\n"
+            "• /funk - Quick funky edit\n"
+            "• /edit - Effects menu (bass, pitch, speed, volume, reverse...)\n"
+            "• /analyze - Song info + BPM\n\n"
+            "*150+ effects:* /edit se bahut presets available hain.\n"
+            "Audio upload karo ya file pe reply karke commands use karo.\n\n"
+            "Language: /lang en  ya  /lang hi"
+        ),
+        "choose_format": "🎚 Quality / format choose karo:",
+        "downloading": "⬇️ Download ho raha hai... {progress}",
+        "processing": "⚙️ FFmpeg se process ho raha hai...",
+        "done": "✅ Ho gaya! Ye raha aapka file:",
+        "error": "❌ Error: {msg}",
+        "cancelled": "🚫 User ne cancel kar diya.",
+        "too_large": "⚠️ File bahut bada hai Telegram ke liye ({size} MB > {limit} MB). Lower quality try karo.",
+        "no_audio": "Koi audio nahi mila. Pehle link bhejo ya audio upload karo.",
+        "lang_switched": "Language Hindi set ho gayi 🇮🇳",
+        "vocal_start": "🎤 Vocals remove / stems extract ho rahe hain... (time lag sakta hai)",
+        "funk_start": "⚡ Auto Funk Edit bana raha hoon...",
+        "analyze_start": "📊 Song analyze ho raha hai...",
+        "choose_effect": "🎚️ Effect / preset choose karo:",
+        "upload_or_link": "Song link bhejo ya audio file upload karo.",
+    },
+}
+
+def get_text(lang: str, key: str, **kwargs) -> str:
+    lang = lang if lang in TEXTS else "en"
+    text = TEXTS[lang].get(key, TEXTS["en"].get(key, key))
+    try:
+        return text.format(**kwargs)
+    except Exception:
+        return text
+
+
+# ===== Embedded utils/downloader.py =====
+import asyncio
+import os
+import re
+from urllib.parse import urlparse
+from typing import Callable, Optional, Dict, Any
+import yt_dlp
+
+class DownloadCancelled(Exception):
+    pass
+
+
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r'[<>:"/\\|?*]', "_", name)
+    return name[:180].strip() or "audio"
+
+
+def validate_url(url: str) -> str:
+    """Accept only normal HTTP(S) links; reject malformed/other schemes."""
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or not parsed.hostname:
+        raise ValueError("Please send a valid http:// or https:// music link.")
+    if any(ch.isspace() for ch in url):
+        raise ValueError("The link contains spaces. Please send a valid URL.")
+    return url.strip()
+
+
+async def get_info(url: str) -> Dict[str, Any]:
+    url = validate_url(url)
+    opts = {**YDL_OPTS_BASE, "skip_download": True}
+    loop = asyncio.get_event_loop()
+
+    def _extract():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    return await loop.run_in_executor(None, _extract)
+
+
+async def download_audio(
+    url: str,
+    format_id: str = "bestaudio/best",
+    progress_callback: Optional[Callable] = None,
+    cancel_event: Optional[asyncio.Event] = None,
+    out_dir: str = TEMP_DIR,
+) -> str:
+    """
+    Download audio. Returns path to downloaded file.
+    progress_callback(status_dict) can be used to update UI.
+    """
+    url = validate_url(url)
+    os.makedirs(out_dir, exist_ok=True)
+    out_tmpl = os.path.join(out_dir, "%(title).180B [%(id)s].%(ext)s")
+
+    def progress_hook(d):
+        if cancel_event and cancel_event.is_set():
+            raise DownloadCancelled("User cancelled")
+        if progress_callback and d.get("status") in ("downloading", "finished"):
+            # schedule callback carefully; we run in executor so just store
+            progress_callback(d)
+
+    opts = {
+        **YDL_OPTS_BASE,
+        "format": format_id,
+        "outtmpl": out_tmpl,
+        "progress_hooks": [progress_hook],
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }
+        ],
+        "prefer_ffmpeg": True,
+    }
+
+    loop = asyncio.get_event_loop()
+    info_holder = {}
+
+    def _download():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            info_holder["info"] = info
+            # Post-processing can change the extension/path, so prefer existing files.
+            candidates = []
+            requested = info.get("requested_downloads") or []
+            for item in requested:
+                fp = item.get("filepath") or item.get("_filename")
+                if fp:
+                    candidates.append(fp)
+                    root, _ = os.path.splitext(fp)
+                    candidates.extend(root + ext for ext in (".mp3", ".m4a", ".opus", ".wav", ".webm"))
+            if info.get("_filename"):
+                candidates.append(info["_filename"])
+            for candidate in candidates:
+                if candidate and os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                    return candidate
+            # Fallback by media ID, newest file first.
+            media_id = str(info.get("id", ""))
+            matches = [os.path.join(out_dir, f) for f in os.listdir(out_dir)
+                       if media_id and media_id in f and not f.endswith((".part", ".ytdl"))]
+            matches = [f for f in matches if os.path.isfile(f) and os.path.getsize(f) > 0]
+            if matches:
+                return max(matches, key=os.path.getmtime)
+            raise FileNotFoundError("Downloaded audio file not found after conversion")
+
+    try:
+        path = await loop.run_in_executor(None, _download)
+        # size check
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        if size_mb > MAX_FILE_SIZE_MB:
+            os.remove(path)
+            raise ValueError(f"File too large: {size_mb:.1f} MB")
+        return path
+    except (DownloadCancelled, ValueError):
+        raise
+    except Exception as e:
+        raise RuntimeError(str(e)) from e
+
+
+def list_audio_formats(info: dict) -> list:
+    """Return list of (format_id, label, approx_size) for audio-ish formats."""
+    formats = []
+    seen = set()
+    for f in info.get("formats", []):
+        if f.get("vcodec") != "none" and f.get("acodec") == "none":
+            continue  # pure video
+        fid = f.get("format_id")
+        if not fid or fid in seen:
+            continue
+        seen.add(fid)
+        note = f.get("format_note") or f.get("resolution") or ""
+        ext = f.get("ext", "")
+        abr = f.get("abr") or f.get("tbr")
+        size = f.get("filesize") or f.get("filesize_approx")
+        size_str = f"{size/1024/1024:.1f}MB" if size else "?"
+        label = f"{note} {ext} {abr or ''}kbps ~{size_str}".strip()
+        formats.append((fid, label, size))
+    # Always offer best audio
+    formats.insert(0, ("bestaudio/best", "Best Audio (auto)", None))
+    formats.insert(1, ("bestaudio[ext=m4a]/bestaudio", "Best M4A / Audio", None))
+    return formats[:12]  # limit buttons
+
+
+# ===== Embedded utils/ffmpeg_tools.py =====
+import asyncio
+import os
+import subprocess
+import shlex
+from typing import Optional
+
+
+async def run_ffmpeg(cmd: list, timeout: int = 600) -> str:
+    """Run ffmpeg command, return stdout+stderr on failure."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError("FFmpeg timed out")
+    if proc.returncode != 0:
+        err = (stderr or b"").decode(errors="ignore")[-1500:]
+        raise RuntimeError(f"FFmpeg error:\n{err}")
+    return (stdout or b"").decode(errors="ignore")
+
+
+def _out_path(inp: str, suffix: str) -> str:
+    base = os.path.splitext(os.path.basename(inp))[0]
+    return os.path.join(TEMP_DIR, f"{base}_{suffix}.mp3")
+
+
+async def change_speed(input_path: str, speed: float = 1.25) -> str:
+    """Change tempo without changing pitch (uses atempo)."""
+    out = _out_path(input_path, f"speed{speed}")
+    # atempo accepts 0.5-2.0; chain if needed
+    filters = []
+    s = speed
+    while s > 2.0:
+        filters.append("atempo=2.0")
+        s /= 2.0
+    while s < 0.5:
+        filters.append("atempo=0.5")
+        s /= 0.5
+    filters.append(f"atempo={s:.4f}")
+    af = ",".join(filters)
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-filter:a", af, "-vn", out]
+    await run_ffmpeg(cmd)
+    return out
+
+
+async def change_pitch(input_path: str, semitones: float = 2.0) -> str:
+    """Pitch shift using asetrate + aresample (simple, quality ok)."""
+    out = _out_path(input_path, f"pitch{semitones}")
+    factor = 2 ** (semitones / 12.0)
+    # asetrate changes pitch+speed, then atempo corrects speed
+    af = f"asetrate=44100*{factor:.6f},aresample=44100,atempo={1/factor:.6f}"
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-filter:a", af, "-vn", out]
+    await run_ffmpeg(cmd)
+    return out
+
+
+async def bass_boost(input_path: str, gain: float = 8.0) -> str:
+    out = _out_path(input_path, "bass")
+    af = f"bass=g={gain}:f=100:w=0.5"
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-filter:a", af, "-vn", out]
+    await run_ffmpeg(cmd)
+    return out
+
+
+async def change_volume(input_path: str, db: float = 5.0) -> str:
+    out = _out_path(input_path, f"vol{db}")
+    af = f"volume={db}dB"
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-filter:a", af, "-vn", out]
+    await run_ffmpeg(cmd)
+    return out
+
+
+async def reverse_audio(input_path: str) -> str:
+    out = _out_path(input_path, "reverse")
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-filter:a", "areverse", "-vn", out]
+    await run_ffmpeg(cmd)
+    return out
+
+
+async def nightcore(input_path: str) -> str:
+    """Classic nightcore: speed up + pitch up."""
+    out = _out_path(input_path, "nightcore")
+    # ~1.25 speed + ~3-4 semitones feel
+    af = "asetrate=44100*1.25,aresample=44100,atempo=1.0"
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-filter:a", af, "-vn", out]
+    await run_ffmpeg(cmd)
+    return out
+
+
+async def vaporwave(input_path: str) -> str:
+    out = _out_path(input_path, "vaporwave")
+    af = "asetrate=44100*0.8,aresample=44100,atempo=1.0,bass=g=5"
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-filter:a", af, "-vn", out]
+    await run_ffmpeg(cmd)
+    return out
+
+
+async def auto_funk(input_path: str) -> str:
+    """Simple auto-funk: mild speed up, bass boost, slight pitch."""
+    out = _out_path(input_path, "funk")
+    af = "asetrate=44100*1.08,aresample=44100,atempo=1.0,bass=g=6:f=110,treble=g=2"
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-filter:a", af, "-vn", out]
+    await run_ffmpeg(cmd)
+    return out
+
+
+async def basic_vocal_remove(input_path: str) -> str:
+    """
+    Simple center-channel vocal removal (karaoke style).
+    Works best on stereo tracks where vocals are centered.
+    For high quality use Demucs (optional heavy dependency).
+    """
+    out = _out_path(input_path, "instrumental")
+    # Classic karaoke filter
+    af = "pan=stereo|c0=c0-c1|c1=c1-c0"
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-filter:a", af, "-vn", out]
+    await run_ffmpeg(cmd)
+    return out
+
+
+async def extract_vocals_basic(input_path: str) -> str:
+    """Rough vocal extract (opposite of karaoke)."""
+    out = _out_path(input_path, "vocals")
+    af = "pan=mono|c0=0.5*c0+-0.5*c1"
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-filter:a", af, "-ac", "1", "-vn", out]
+    await run_ffmpeg(cmd)
+    return out
+
+
+async def try_demucs_vocal_remove(input_path: str) -> Optional[str]:
+    """Try Demucs if installed. Returns path to instrumental or None."""
+    try:
+        import demucs.separate
+        # demucs CLI style via subprocess is more reliable
+        out_dir = os.path.join(TEMP_DIR, "demucs_out")
+        os.makedirs(out_dir, exist_ok=True)
+        cmd = [
+            "python", "-m", "demucs",
+            "--two-stems", "vocals",
+            "-n", "htdemucs",
+            "-o", out_dir,
+            input_path,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=900)
+        if proc.returncode != 0:
+            return None
+        # Find no_vocals / instrumental
+        for root, _, files in os.walk(out_dir):
+            for f in files:
+                if "no_vocals" in f or "instrumental" in f.lower():
+                    return os.path.join(root, f)
+        return None
+    except Exception:
+        return None
+
+
+# Preset map for /edit buttons
+EFFECT_PRESETS = {
+    "bass_boost": ("Bass Boost", bass_boost),
+    "speed_up": ("Speed 1.25x", lambda p: change_speed(p, 1.25)),
+    "slow_down": ("Slow 0.8x", lambda p: change_speed(p, 0.8)),
+    "pitch_up": ("Pitch +2", lambda p: change_pitch(p, 2)),
+    "pitch_down": ("Pitch -2", lambda p: change_pitch(p, -2)),
+    "volume_up": ("Volume +5dB", lambda p: change_volume(p, 5)),
+    "reverse": ("Reverse", reverse_audio),
+    "nightcore": ("Nightcore", nightcore),
+    "vaporwave": ("Vaporwave", vaporwave),
+    "funk": ("Auto Funk", auto_funk),
+}
+
+
+async def get_duration(path: str) -> float:
+    cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", path
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    out, _ = await proc.communicate()
+    try:
+        return float(out.decode().strip())
+    except Exception:
+        return 0.0
+
+
+# ===== Main bot =====
 
 import asyncio
 import logging
@@ -28,17 +497,6 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from config import BOT_TOKEN, TEMP_DIR, MAX_FILE_SIZE_MB, DEFAULT_LANG
-from locales import get_text
-from utils.downloader import get_info, download_audio, list_audio_formats, DownloadCancelled
-from utils.ffmpeg_tools import (
-    EFFECT_PRESETS,
-    auto_funk,
-    basic_vocal_remove,
-    extract_vocals_basic,
-    try_demucs_vocal_remove,
-    get_duration,
-)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
