@@ -913,10 +913,27 @@ async def analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    if not BOT_TOKEN or BOT_TOKEN == "your_bot_token_here_from_BotFather":
-        raise SystemExit("ERROR: Set a valid BOT_TOKEN in .env (get it from @BotFather).")
+    # Railway injects service variables into the process environment.
+    # Read at startup and strip accidental spaces/newlines from copy-paste.
+    token = os.environ.get("BOT_TOKEN", BOT_TOKEN).strip()
+    placeholder_values = {
+        "your_bot_token_here_from_BotFather",
+        "PASTE_YOUR_BOTFATHER_TOKEN_IN_RAILWAY_VARIABLES",
+    }
+    if not token or token in placeholder_values:
+        raise SystemExit(
+            "ERROR: BOT_TOKEN is missing. In Railway, open this service's Variables tab, "
+            "set BOT_TOKEN to the full token from @BotFather, save it, then redeploy. "
+            "Do not use the placeholder text and do not upload a real token to GitHub."
+        )
+    token_id, separator, token_secret = token.partition(":")
+    if not separator or not token_id.isdigit() or len(token_secret) < 20:
+        raise SystemExit(
+            "ERROR: BOT_TOKEN format looks invalid. Copy the complete token from @BotFather "
+            "into Railway Variables as BOT_TOKEN, then redeploy. Keep the token private."
+        )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu\|"))
